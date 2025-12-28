@@ -639,12 +639,13 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
+    # Поле ввода чата (всегда видимое)
+    user_input = st.chat_input("Задайте вопрос...")
+    
     # Обработка примера из боковой панели
     if "pending_message" in st.session_state:
         user_input = st.session_state.pending_message
         del st.session_state.pending_message
-    else:
-        user_input = st.chat_input("Задайте вопрос...")
     
     # Обработка ввода
     if user_input:
