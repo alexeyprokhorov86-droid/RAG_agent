@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 import anthropic
 import json
 import re
+import requests
+from urllib.parse import quote_plus
 
 # ============================================================
 # НАСТРОЙКИ
@@ -353,11 +355,119 @@ def get_summary_stats() -> dict:
     }
 
 
+def web_search(query: str, max_results: int = 5) -> dict:
+    """Поиск в интернете через DuckDuckGo"""
+    try:
+        # DuckDuckGo Instant Answer API
+        url = "https://api.duckduckgo.com/"
+        params = {
+            "q": query,
+            "format": "json",
+            "no_html": 1,
+            "skip_disambig": 1
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        results = []
+        
+        # Основной ответ
+        if data.get("AbstractText"):
+            results.append({
+                "title": data.get("Heading", ""),
+                "snippet": data.get("AbstractText", ""),
+                "source": data.get("AbstractSource", ""),
+                "url": data.get("AbstractURL", "")
+            })
+        
+        # Связанные темы
+        for topic in data.get("RelatedTopics", [])[:max_results]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append({
+                    "title": topic.get("Text", "")[:100],
+                    "snippet": topic.get("Text", ""),
+                    "url": topic.get("FirstURL", "")
+                })
+        
+        # Если нет результатов от DuckDuckGo API, делаем HTML поиск
+        if not results:
+            search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            resp = requests.get(search_url, headers=headers, timeout=10)
+            
+            # Простой парсинг результатов
+            from html.parser import HTMLParser
+            
+            class DDGParser(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.results = []
+                    self.current = {}
+                    self.in_result = False
+                    self.in_title = False
+                    self.in_snippet = False
+                
+                def handle_starttag(self, tag, attrs):
+                    attrs = dict(attrs)
+                    if tag == "a" and "result__a" in attrs.get("class", ""):
+                        self.in_title = True
+                        self.current["url"] = attrs.get("href", "")
+                    elif tag == "a" and "result__snippet" in attrs.get("class", ""):
+                        self.in_snippet = True
+                
+                def handle_endtag(self, tag):
+                    if tag == "a" and self.in_title:
+                        self.in_title = False
+                    elif tag == "a" and self.in_snippet:
+                        self.in_snippet = False
+                        if self.current:
+                            self.results.append(self.current)
+                            self.current = {}
+                
+                def handle_data(self, data):
+                    if self.in_title:
+                        self.current["title"] = data.strip()
+                    elif self.in_snippet:
+                        self.current["snippet"] = data.strip()
+            
+            parser = DDGParser()
+            parser.feed(resp.text)
+            results = parser.results[:max_results]
+        
+        return {
+            "type": "web_search",
+            "query": query,
+            "results": results,
+            "results_count": len(results)
+        }
+        
+    except Exception as e:
+        return {
+            "type": "web_search",
+            "query": query,
+            "error": str(e),
+            "results": []
+        }
+
+
 # ============================================================
 # ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ LLM
 # ============================================================
 
 TOOLS = [
+    {
+        "name": "web_search",
+        "description": "Поиск информации в интернете. Используй для вопросов о внешней информации: новости, цены на рынке, информация о компаниях, законы, общие знания.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поисковый запрос"},
+                "max_results": {"type": "integer", "description": "Максимум результатов", "default": 5}
+            },
+            "required": ["query"]
+        }
+    },
     {
         "name": "search_purchases",
         "description": "Поиск по закупкам (документы 'Приобретение товаров и услуг'). Используй для вопросов о закупках, поставщиках, закупочных ценах.",
@@ -458,7 +568,9 @@ TOOLS = [
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     """Выполняет инструмент и возвращает результат"""
     try:
-        if tool_name == "search_purchases":
+        if tool_name == "web_search":
+            result = web_search(**tool_input)
+        elif tool_name == "search_purchases":
             result = search_purchases(**tool_input)
         elif tool_name == "search_sales":
             result = search_sales(**tool_input)
@@ -488,20 +600,30 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
 SYSTEM_PROMPT = """Ты — интеллектуальный помощник компании "Кондитерская Прохорова".
 
-У тебя есть доступ к данным компании из 1С:
-- Закупки (поставщики, цены, номенклатура)
-- Продажи (клиенты, реализации, корректировки)
-- Справочник номенклатуры (товары, продукция)
-- Справочник клиентов
+У тебя есть доступ к:
+
+1. ДАННЫЕ КОМПАНИИ из 1С:
+   - Закупки (поставщики, цены, номенклатура)
+   - Продажи (клиенты, реализации, корректировки)
+   - Справочник номенклатуры (товары, продукция)
+   - Справочник клиентов
+
+2. ИНТЕРНЕТ (веб-поиск):
+   - Новости и актуальная информация
+   - Рыночные цены и аналитика
+   - Информация о компаниях и контрагентах
+   - Законы, регламенты, стандарты
 
 Правила:
 1. Используй инструменты для поиска данных перед ответом
-2. Отвечай на русском языке
-3. Форматируй числа с разделителями тысяч (1 234 567)
-4. Суммы указывай в рублях
-5. Если данных нет — так и скажи, не выдумывай
-6. При аналитических вопросах показывай статистику и выводы
-7. Будь кратким, но информативным
+2. Для внутренних данных компании — используй search_purchases, search_sales и др.
+3. Для внешней информации — используй web_search
+4. Отвечай на русском языке
+5. Форматируй числа с разделителями тысяч (1 234 567)
+6. Суммы указывай в рублях
+7. Если данных нет — так и скажи, не выдумывай
+8. При аналитических вопросах показывай статистику и выводы
+9. Будь кратким, но информативным
 
 Текущая дата: {current_date}
 """
@@ -614,6 +736,7 @@ def main():
             "Покажи закупки сахара за последний месяц",
             "Какая динамика цен на муку?",
             "Найди клиента Магнит",
+            "Какие сейчас цены на сахар на рынке?",
         ]
         for ex in examples:
             if st.button(ex, key=f"ex_{ex}", use_container_width=True):
