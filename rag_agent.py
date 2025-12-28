@@ -452,10 +452,267 @@ def web_search(query: str, max_results: int = 5) -> dict:
 
 
 # ============================================================
+# ФУНКЦИИ ПАМЯТИ АГЕНТА
+# ============================================================
+
+def init_memory_tables():
+    """Создаёт таблицы памяти если их нет"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # История чатов
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id SERIAL PRIMARY KEY,
+                session_id VARCHAR(100),
+                user_id VARCHAR(100) DEFAULT 'default',
+                role VARCHAR(20) NOT NULL,
+                content TEXT NOT NULL,
+                tools_used JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        
+        # Индекс для полнотекстового поиска
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_history_content_gin 
+            ON chat_history USING gin(to_tsvector('russian', content))
+        """)
+        
+        # Память агента
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS agent_memory (
+                id SERIAL PRIMARY KEY,
+                category VARCHAR(100),
+                subject VARCHAR(300),
+                fact TEXT NOT NULL,
+                source VARCHAR(200),
+                confidence FLOAT DEFAULT 1.0,
+                user_id VARCHAR(100) DEFAULT 'default',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        """)
+        
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        st.error(f"Ошибка создания таблиц памяти: {e}")
+        return False
+
+
+def save_message_to_history(session_id: str, role: str, content: str, tools_used: list = None):
+    """Сохраняет сообщение в историю"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO chat_history (session_id, role, content, tools_used)
+            VALUES (%s, %s, %s, %s)
+        """, (session_id, role, content, json.dumps(tools_used) if tools_used else None))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        pass  # Не прерываем работу если не удалось сохранить
+
+
+def search_chat_history(query: str, limit: int = 10) -> dict:
+    """Поиск по истории чатов"""
+    try:
+        conn = get_db_connection()
+        
+        # Полнотекстовый поиск по русски
+        sql = """
+            SELECT role, content, created_at,
+                   ts_rank(to_tsvector('russian', content), plainto_tsquery('russian', %s)) as rank
+            FROM chat_history
+            WHERE to_tsvector('russian', content) @@ plainto_tsquery('russian', %s)
+            ORDER BY rank DESC, created_at DESC
+            LIMIT %s
+        """
+        df = pd.read_sql(sql, conn, params=(query, query, limit))
+        
+        if df.empty:
+            # Пробуем простой ILIKE если полнотекстовый не дал результатов
+            sql_simple = """
+                SELECT role, content, created_at
+                FROM chat_history
+                WHERE content ILIKE %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """
+            df = pd.read_sql(sql_simple, conn, params=(f"%{query}%", limit))
+        
+        return {
+            "type": "chat_history",
+            "query": query,
+            "results": df.to_dict('records') if not df.empty else [],
+            "total_found": len(df)
+        }
+    except Exception as e:
+        return {
+            "type": "chat_history",
+            "query": query,
+            "error": str(e),
+            "results": []
+        }
+
+
+def search_agent_memory(query: str = None, category: str = None, limit: int = 20) -> dict:
+    """Поиск по памяти агента"""
+    try:
+        conn = get_db_connection()
+        
+        conditions = ["is_active = true"]
+        params = []
+        
+        if query:
+            conditions.append("(fact ILIKE %s OR subject ILIKE %s)")
+            params.extend([f"%{query}%", f"%{query}%"])
+        
+        if category:
+            conditions.append("category = %s")
+            params.append(category)
+        
+        sql = f"""
+            SELECT category, subject, fact, source, confidence, created_at
+            FROM agent_memory
+            WHERE {' AND '.join(conditions)}
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT {limit}
+        """
+        
+        df = pd.read_sql(sql, conn, params=tuple(params) if params else None)
+        
+        return {
+            "type": "agent_memory",
+            "query": query,
+            "category": category,
+            "results": df.to_dict('records') if not df.empty else [],
+            "total_found": len(df)
+        }
+    except Exception as e:
+        return {
+            "type": "agent_memory",
+            "error": str(e),
+            "results": []
+        }
+
+
+def save_to_memory(category: str, subject: str, fact: str, source: str = "chat") -> dict:
+    """Сохраняет факт в память агента"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Проверяем нет ли похожего факта
+        cur.execute("""
+            SELECT id FROM agent_memory 
+            WHERE subject ILIKE %s AND fact ILIKE %s AND is_active = true
+            LIMIT 1
+        """, (f"%{subject}%", f"%{fact[:100]}%"))
+        
+        existing = cur.fetchone()
+        
+        if existing:
+            # Обновляем существующий
+            cur.execute("""
+                UPDATE agent_memory 
+                SET updated_at = NOW(), confidence = LEAST(confidence + 0.1, 1.0)
+                WHERE id = %s
+            """, (existing[0],))
+            action = "updated"
+        else:
+            # Создаём новый
+            cur.execute("""
+                INSERT INTO agent_memory (category, subject, fact, source)
+                VALUES (%s, %s, %s, %s)
+            """, (category, subject, fact, source))
+            action = "created"
+        
+        conn.commit()
+        cur.close()
+        
+        return {
+            "type": "save_memory",
+            "status": "success",
+            "action": action,
+            "category": category,
+            "subject": subject
+        }
+    except Exception as e:
+        return {
+            "type": "save_memory",
+            "status": "error",
+            "error": str(e)
+        }
+
+
+def get_recent_context(limit: int = 5) -> dict:
+    """Получает последние сообщения для контекста"""
+    try:
+        conn = get_db_connection()
+        sql = """
+            SELECT role, content, created_at
+            FROM chat_history
+            ORDER BY created_at DESC
+            LIMIT %s
+        """
+        df = pd.read_sql(sql, conn, params=(limit,))
+        
+        return {
+            "type": "recent_context",
+            "messages": df.to_dict('records') if not df.empty else []
+        }
+    except Exception as e:
+        return {"type": "recent_context", "messages": [], "error": str(e)}
+
+
+# ============================================================
 # ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ LLM
 # ============================================================
 
 TOOLS = [
+    {
+        "name": "search_chat_history",
+        "description": "Поиск по истории предыдущих диалогов. Используй когда пользователь спрашивает 'мы обсуждали', 'я спрашивал', 'ты говорил' или нужно найти информацию из прошлых разговоров.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Что искать в истории чатов"},
+                "limit": {"type": "integer", "description": "Максимум результатов", "default": 10}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "search_agent_memory",
+        "description": "Поиск по памяти агента — сохранённым фактам о компании, клиентах, процессах. Используй для поиска ранее узнанной информации.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Что искать"},
+                "category": {"type": "string", "description": "Категория: клиент, продукт, процесс, предпочтение"},
+                "limit": {"type": "integer", "description": "Максимум результатов", "default": 20}
+            }
+        }
+    },
+    {
+        "name": "save_to_memory",
+        "description": "Сохранить важный факт в долгосрочную память. Используй когда пользователь просит запомнить что-то или когда узнаёшь важную информацию о компании.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "Категория: клиент, продукт, процесс, предпочтение, контакт"},
+                "subject": {"type": "string", "description": "О ком или о чём факт"},
+                "fact": {"type": "string", "description": "Сам факт для запоминания"}
+            },
+            "required": ["category", "subject", "fact"]
+        }
+    },
     {
         "name": "web_search",
         "description": "Поиск информации в интернете. Используй для вопросов о внешней информации: новости, цены на рынке, информация о компаниях, законы, общие знания.",
@@ -568,7 +825,13 @@ TOOLS = [
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     """Выполняет инструмент и возвращает результат"""
     try:
-        if tool_name == "web_search":
+        if tool_name == "search_chat_history":
+            result = search_chat_history(**tool_input)
+        elif tool_name == "search_agent_memory":
+            result = search_agent_memory(**tool_input)
+        elif tool_name == "save_to_memory":
+            result = save_to_memory(**tool_input)
+        elif tool_name == "web_search":
             result = web_search(**tool_input)
         elif tool_name == "search_purchases":
             result = search_purchases(**tool_input)
@@ -608,22 +871,27 @@ SYSTEM_PROMPT = """Ты — интеллектуальный помощник к
    - Справочник номенклатуры (товары, продукция)
    - Справочник клиентов
 
-2. ИНТЕРНЕТ (веб-поиск):
+2. ПАМЯТЬ И ИСТОРИЯ:
+   - История всех диалогов (search_chat_history)
+   - Сохранённые факты о компании (search_agent_memory)
+   - Возможность запоминать новую информацию (save_to_memory)
+
+3. ИНТЕРНЕТ (веб-поиск):
    - Новости и актуальная информация
    - Рыночные цены и аналитика
    - Информация о компаниях и контрагентах
-   - Законы, регламенты, стандарты
 
 Правила:
 1. Используй инструменты для поиска данных перед ответом
-2. Для внутренних данных компании — используй search_purchases, search_sales и др.
-3. Для внешней информации — используй web_search
-4. Отвечай на русском языке
-5. Форматируй числа с разделителями тысяч (1 234 567)
-6. Суммы указывай в рублях
-7. Если данных нет — так и скажи, не выдумывай
-8. При аналитических вопросах показывай статистику и выводы
-9. Будь кратким, но информативным
+2. Если пользователь ссылается на прошлые разговоры — ищи в search_chat_history
+3. Если узнаёшь важный факт о компании — сохрани через save_to_memory
+4. Для внутренних данных — используй search_purchases, search_sales и др.
+5. Для внешней информации — используй web_search
+6. Отвечай на русском языке
+7. Форматируй числа с разделителями тысяч (1 234 567)
+8. Суммы указывай в рублях
+9. Если данных нет — так и скажи, не выдумывай
+10. Будь кратким, но информативным
 
 Текущая дата: {current_date}
 """
@@ -709,6 +977,13 @@ def main():
         st.error(f"❌ Ошибка подключения к БД: {e}")
         return
     
+    # Инициализация таблиц памяти
+    init_memory_tables()
+    
+    # Генерируем session_id если нет
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Инициализация истории чата
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -725,6 +1000,8 @@ def main():
         - 💰 Анализ продаж
         - 👥 Информация о клиентах
         - 📊 Статистика и аналитика
+        - 🌐 Поиск в интернете
+        - 🧠 Помню историю наших диалогов
         """)
         
         st.divider()
@@ -737,6 +1014,8 @@ def main():
             "Какая динамика цен на муку?",
             "Найди клиента Магнит",
             "Какие сейчас цены на сахар на рынке?",
+            "Что мы обсуждали раньше?",
+            "Запомни: главный поставщик муки — Агрокомплект",
         ]
         for ex in examples:
             if st.button(ex, key=f"ex_{ex}", use_container_width=True):
@@ -777,6 +1056,9 @@ def main():
         with st.chat_message("user"):
             st.markdown(user_input)
         
+        # Сохраняем в БД
+        save_message_to_history(st.session_state.session_id, "user", user_input)
+        
         # Получаем ответ
         with st.chat_message("assistant"):
             with st.spinner("Думаю..."):
@@ -790,6 +1072,14 @@ def main():
                     # Сохраняем
                     st.session_state.messages.append({"role": "assistant", "content": response})
                     st.session_state.tools_log.extend(tools_used)
+                    
+                    # Сохраняем в БД
+                    save_message_to_history(
+                        st.session_state.session_id, 
+                        "assistant", 
+                        response, 
+                        tools_used
+                    )
                     
                 except Exception as e:
                     error_msg = f"❌ Ошибка: {str(e)}"
